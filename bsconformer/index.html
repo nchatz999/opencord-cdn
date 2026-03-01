@@ -1,0 +1,227 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="utf-8">
+    <title>BSConformer Denoiser Test</title>
+    <style>
+        body {
+            font-family: monospace;
+            max-width: 600px;
+            margin: 40px auto;
+            padding: 0 16px;
+        }
+
+        h1 {
+            font-size: 20px;
+        }
+
+        button {
+            font-size: 16px;
+            padding: 8px 20px;
+            margin: 4px;
+            cursor: pointer;
+        }
+
+        button:disabled {
+            opacity: 0.4;
+            cursor: default;
+        }
+
+        .active {
+            background: #4CAF50;
+            color: white;
+        }
+
+        #status {
+            margin-top: 16px;
+            padding: 8px;
+            background: #f5f5f5;
+            white-space: pre-line;
+        }
+    </style>
+</head>
+
+<body>
+    <h1>BSConformer Denoiser</h1>
+    <p>Real-time speech enhancement via WASM (48kHz, 10ms frames).</p>
+    <div>
+        <button id="startBtn">Start</button>
+        <button id="stopBtn" disabled>Stop</button>
+        <button id="bypassBtn">Bypass: OFF</button>
+    </div>
+    <div id="status">Click Start to begin.</div>
+
+    <script>
+        const FRAME = 480;
+
+        const startBtn = document.getElementById("startBtn");
+        const stopBtn = document.getElementById("stopBtn");
+        const bypassBtn = document.getElementById("bypassBtn");
+        const statusEl = document.getElementById("status");
+
+        let audioCtx = null;
+        let micStream = null;
+        let sourceNode = null;
+        let processorNode = null;
+        let bypass = false;
+
+        // WASM state (main thread)
+        let wasm = null;
+        let modelPtr = 0;
+        let statePtr = 0;
+        let inputPtr = 0;
+        let outputPtr = 0;
+
+        function log(msg) {
+            statusEl.textContent = msg;
+        }
+
+        function initWasm(wasmModule) {
+            // Build WASI stubs from what the binary actually imports
+            const needed = WebAssembly.Module.imports(wasmModule);
+            const importObj = {};
+            for (const imp of needed) {
+                if (!importObj[imp.module]) importObj[imp.module] = {};
+                if (imp.kind === "function") {
+                    importObj[imp.module][imp.name] = () => 0;
+                }
+            }
+
+            log("Instantiating WASM...");
+            const instance = new WebAssembly.Instance(wasmModule, importObj);
+            wasm = instance.exports;
+
+            log("Creating model (computing DFT matrices)...");
+            modelPtr = wasm.bsconf_create();
+            if (!modelPtr) throw new Error("bsconf_create returned null");
+
+            log("Loading weights...");
+            wasm.bsconf_load_weights(modelPtr);
+            statePtr = wasm.bsconf_state_create();
+            if (!statePtr) throw new Error("bsconf_state_create returned null");
+
+            inputPtr = wasm.malloc(FRAME * 4);
+            outputPtr = wasm.malloc(FRAME * 4);
+        }
+
+        // --- Buffering state ---
+        const accum = new Float32Array(FRAME + 4096);
+        let accumLen = 0;
+        const outQueue = [];
+        let outOffset = 0;
+
+        function processAudio(inputData, outputData) {
+            if (bypass) {
+                outputData.set(inputData);
+                return;
+            }
+
+            // Accumulate input
+            accum.set(inputData, accumLen);
+            accumLen += inputData.length;
+
+            // Process complete 480-sample frames
+            while (accumLen >= FRAME) {
+                const wasmIn = new Float32Array(wasm.memory.buffer, inputPtr, FRAME);
+                const wasmOut = new Float32Array(wasm.memory.buffer, outputPtr, FRAME);
+
+                wasmIn.set(accum.subarray(0, FRAME));
+                wasm.bsconf_process_frame(modelPtr, statePtr, inputPtr, outputPtr);
+                outQueue.push(new Float32Array(wasmOut));
+
+                // Shift remainder
+                const rem = accumLen - FRAME;
+                if (rem > 0) accum.copyWithin(0, FRAME, FRAME + rem);
+                accumLen = rem;
+            }
+
+            // Drain output
+            let written = 0;
+            while (written < outputData.length && outQueue.length > 0) {
+                const frame = outQueue[0];
+                const avail = frame.length - outOffset;
+                const take = Math.min(avail, outputData.length - written);
+                outputData.set(frame.subarray(outOffset, outOffset + take), written);
+                written += take;
+                outOffset += take;
+                if (outOffset >= frame.length) {
+                    outQueue.shift();
+                    outOffset = 0;
+                }
+            }
+            if (written < outputData.length) outputData.fill(0, written);
+        }
+
+        startBtn.onclick = async () => {
+            try {
+                startBtn.disabled = true;
+                log("Loading WASM...");
+
+                const resp = await fetch("bsconformer.wasm");
+                if (!resp.ok) throw new Error("Failed to fetch bsconformer.wasm (run build.sh first)");
+                const wasmBytes = await resp.arrayBuffer();
+                const wasmModule = await WebAssembly.compile(wasmBytes);
+
+                initWasm(wasmModule);
+
+                log("Setting up audio...");
+
+                audioCtx = new AudioContext({sampleRate: 48000});
+                if (audioCtx.sampleRate !== 48000) {
+                    log("Warning: running at " + audioCtx.sampleRate + " Hz, expected 48000");
+                }
+
+                micStream = await navigator.mediaDevices.getUserMedia({
+                    audio: {
+                        sampleRate: 48000,
+                        echoCancellation: false,
+                        noiseSuppression: false,
+                        autoGainControl: false,
+                    },
+                });
+
+                sourceNode = audioCtx.createMediaStreamSource(micStream);
+
+                // ScriptProcessorNode: runs on main thread, simple and reliable
+                processorNode = audioCtx.createScriptProcessor(4096, 1, 1);
+                processorNode.onaudioprocess = (e) => {
+                    const input = e.inputBuffer.getChannelData(0);
+                    const output = e.outputBuffer.getChannelData(0);
+                    processAudio(input, output);
+                };
+
+                sourceNode.connect(processorNode);
+                processorNode.connect(audioCtx.destination);
+
+                stopBtn.disabled = false;
+                log("Running -- speak into microphone.");
+            } catch (err) {
+                log("Error: " + err.message);
+                console.error(err);
+                startBtn.disabled = false;
+            }
+        };
+
+        stopBtn.onclick = () => {
+            if (sourceNode) {sourceNode.disconnect(); sourceNode = null;}
+            if (processorNode) {processorNode.disconnect(); processorNode = null;}
+            if (micStream) {micStream.getTracks().forEach((t) => t.stop()); micStream = null;}
+            if (audioCtx) {audioCtx.close(); audioCtx = null;}
+            accumLen = 0;
+            outQueue.length = 0;
+            outOffset = 0;
+            startBtn.disabled = false;
+            stopBtn.disabled = true;
+            log("Stopped.");
+        };
+
+        bypassBtn.onclick = () => {
+            bypass = !bypass;
+            bypassBtn.textContent = "Bypass: " + (bypass ? "ON" : "OFF");
+            bypassBtn.classList.toggle("active", bypass);
+        };
+    </script>
+</body>
+
+</html>
